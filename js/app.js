@@ -286,7 +286,7 @@ function shell({ title = '', back = '', actions = '', body = '', dock = true, pa
     ${dock ? `
     <nav class="dock" aria-label="Действия"><div class="dock-inner">
       <a class="btn btn-primary" href="#/add">${icon('plus')}Добавить</a>
-      <a class="btn btn-ink" href="#/scan">${icon('scan')}Забрать по QR</a>
+      <a class="btn btn-ink" href="#/scan">${icon('scan')}Считать данные по QR</a>
     </div></nav>` : ''}`;
 }
 
@@ -656,7 +656,7 @@ function viewItem(id) {
         <div class="qr" data-qr></div>
         <div class="qr-meta">
           <h3>QR-код позиции</h3>
-          <p>Наклейте на упаковку. Когда берёте продукт — отсканируйте его кнопкой «Забрать по QR».</p>
+          <p>Наклейте на упаковку. Когда берёте продукт — отсканируйте его кнопкой «Считать данные по QR».</p>
           <button class="btn btn-secondary" data-print>${icon('printer')}Печать этикетки</button>
         </div>
       </section>
@@ -818,7 +818,7 @@ function viewForm(id) {
 function viewScan() {
   app.innerHTML = shell({
     back: '#/',
-    title: 'Забрать по QR',
+    title: 'Считать данные по QR',
     body: `
       <div class="scanner">
         <video muted playsinline autoplay></video>
@@ -853,23 +853,23 @@ function viewScan() {
     const qty = qtyOf(item);
     const exp = expiry(item.expires, qty > 0);
     sheet.innerHTML = `
-      <div class="sheet" role="dialog" aria-label="Найдена позиция"><div class="sheet-inner">
-        <div class="sheet-item">
+      <div class="sheet" role="dialog" aria-label="Данные позиции"><div class="sheet-inner">
+        <a class="sheet-item" href="#/item/${esc(item.id)}">
           ${thumb(item)}
           <div class="row-main">
             <div class="row-name">${esc(item.name)}</div>
             <div class="row-exp ${exp.cls}">${esc(exp.label)}</div>
             <div class="row-qty ${qty ? '' : 'out'}">${qtyLabel(qty)}</div>
           </div>
-        </div>
-        <button class="btn btn-primary btn-block" data-take ${qty ? '' : 'disabled'}>${icon('check')}${qty ? 'Забрать 1 шт.' : 'Закончилось'}</button>
+        </a>
+        ${item.description ? `<p class="sheet-desc">${esc(item.description)}</p>` : ''}
         <div class="sheet-row">
-          <a class="btn btn-secondary" href="#/item/${esc(item.id)}">Карточка</a>
-          <button class="btn btn-secondary" data-cancel>Отмена</button>
+          <button class="btn btn-secondary" data-close>Закрыть</button>
+          <button class="btn btn-primary" data-take ${qty ? '' : 'disabled'}>Забрать 1 единицу</button>
         </div>
       </div></div>`;
     hydrateImages(sheet);
-    sheet.querySelector('[data-cancel]').addEventListener('click', () => closeSheet());
+    sheet.querySelector('[data-close]').addEventListener('click', () => closeSheet());
     sheet.querySelector('[data-take]').addEventListener('click', async (event) => {
       const saved = await withBusy(event.currentTarget, () => store.changeQty(item.id, -1, 'Забрано'));
       if (saved) {

@@ -213,7 +213,7 @@ code { font: 13px ui-monospace, SFMono-Regular, Menlo, monospace; background: va
   grid-template-columns: 1fr 1fr;
   gap: 10px;
 }
-.dock .btn { min-height: 50px; padding: 0 12px; }
+.dock .btn { min-height: 50px; padding: 0 12px; text-align: center; }
 /* на телефоне клавиатура и так занимает пол-экрана */
 body:has(.page-form :is(input, textarea):focus) .dock { display: none; }
 
@@ -629,7 +629,18 @@ body:has(.page-form :is(input, textarea):focus) .dock { display: none; }
   animation: rise .22s ease-out;
 }
 .sheet-inner { max-width: 640px; margin: 0 auto; display: grid; gap: 10px; }
-.sheet-item { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; }
+.sheet-item { display: flex; align-items: center; gap: 14px; margin-bottom: 6px; color: inherit; }
+.sheet-desc {
+  display: -webkit-box;
+  margin: 0 0 6px;
+  overflow: hidden;
+  -webkit-box-orient: vertical;
+  -webkit-line-clamp: 3;
+  font-size: 14px;
+  color: var(--muted);
+  white-space: pre-wrap;
+  overflow-wrap: anywhere;
+}
 .sheet-row { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; }
 
 /* ---------- settings */
