@@ -1,12 +1,21 @@
 import { textToB64, b64ToText } from './crypto.js';
 
-// Формат позиции: { id, name, description, expires: 'YYYY-MM-DD' | '', image, imageSha, createdAt, updatedAt }
+// Формат позиции: { id, name, description, qty, expires: 'YYYY-MM-DD' | '', image, imageSha, createdAt, updatedAt }
 // image — data URL (локальный режим) или путь к файлу в репозитории (режим GitHub).
+// qty — сколько штук осталось; у позиций, записанных до появления поля, считаем 1.
 
 const LOCAL_DB = 'pantry.local.db';
 const API = 'https://api.github.com';
+export const MAX_QTY = 9999;
 
 const nowIso = () => new Date().toISOString();
+
+// Целое от 0 до MAX_QTY; пустое или нечисловое значение заменяется на fallback.
+export function toQty(value, fallback = 1) {
+  const n = Math.round(Number(value));
+  if (value === '' || value == null || !Number.isFinite(n)) return fallback;
+  return Math.min(Math.max(n, 0), MAX_QTY);
+}
 
 function readJSON(key) {
   try {
@@ -19,7 +28,7 @@ function readJSON(key) {
 function normalize(items) {
   return (Array.isArray(items) ? items : [])
     .filter((item) => item && item.id)
-    .map((item) => ({ name: '', description: '', expires: '', image: '', imageSha: '', ...item }));
+    .map((item) => ({ name: '', description: '', expires: '', image: '', imageSha: '', ...item, qty: toQty(item.qty) }));
 }
 
 function upsertIn(items, item) {
@@ -56,6 +65,12 @@ export class LocalStore {
     if (image !== undefined) item.image = image || '';
     this.#save(upsertIn([...this.items], item));
     return item;
+  }
+
+  async changeQty(id, delta) {
+    const prev = this.items.find((i) => i.id === id);
+    if (!prev) throw new Error('Позиция уже удалена');
+    return this.upsert({ id, qty: toQty(prev.qty + delta) });
   }
 
   async remove(id) {
@@ -225,6 +240,22 @@ export class GitHubStore {
       else if (image === null) Object.assign(item, { image: '', imageSha: '' });
       await this.#commitItems((items) => upsertIn(items, item), `${prev ? 'Изменено' : 'Добавлено'}: ${item.name}`);
       if (oldImage) this.#dropImage(oldImage.path, oldImage.sha, `Старое фото: ${item.name}`);
+      return item;
+    });
+  }
+
+  // Записывает не итог, а разницу: если с другого устройства тоже что-то взяли,
+  // при повторной попытке учтутся оба изменения.
+  changeQty(id, delta, verb = delta > 0 ? 'Добавлено' : 'Убрано') {
+    return this.#enqueue(async () => {
+      const name = this.items.find((i) => i.id === id)?.name ?? id;
+      let item;
+      await this.#commitItems((items) => {
+        item = items.find((i) => i.id === id);
+        if (!item) throw new Error('Позиция уже удалена');
+        Object.assign(item, { qty: toQty(item.qty + delta), updatedAt: nowIso() });
+        return items;
+      }, `${verb} ${Math.abs(delta)} шт.: ${name}`);
       return item;
     });
   }

@@ -1,5 +1,5 @@
 import * as auth from './auth.js';
-import { createStore, LocalStore } from './store.js';
+import { createStore, LocalStore, toQty, MAX_QTY } from './store.js';
 import { compressImage } from './image.js';
 import { qrSvg, itemUrl, parseItemCode, startScanner, decodeImageFile } from './qr.js';
 import { icon } from './icons.js';
@@ -46,14 +46,15 @@ function toISODate(date) {
   return `${date.getFullYear()}-${pad(date.getMonth() + 1)}-${pad(date.getDate())}`;
 }
 
-function expiry(expires) {
+// active = false — продукт закончился, и подсвечивать его срок незачем.
+function expiry(expires, active = true) {
   if (!expires) return { left: Infinity, cls: '', label: 'Срок не указан', full: 'Срок годности не указан' };
   const [y, m, d] = expires.split('-').map(Number);
   const date = new Date(y, m - 1, d);
   const today = new Date();
   today.setHours(0, 0, 0, 0);
   const left = Math.round((date - today) / 86_400_000);
-  const cls = left < 0 ? 'exp-expired' : left <= cfg.warnDays ? 'exp-soon' : '';
+  const cls = !active ? '' : left < 0 ? 'exp-expired' : left <= cfg.warnDays ? 'exp-soon' : '';
   const rel = left < 0 ? `просрочено на ${daysText(-left)}`
     : left === 0 ? 'истекает сегодня'
     : left === 1 ? 'истекает завтра'
@@ -141,6 +142,102 @@ function formHandler(name, handler) {
     }
   });
   return form;
+}
+
+/* ------------------------------------------------------------ quantity */
+
+// Нажатия −/+ копятся и уходят одной записью: пять «+» подряд — один коммит, а не пять.
+// В хранилище уходит разница, а не итог, так что правки с разных устройств складываются.
+const qtyEdits = new Map(); // id → { delta, inflight, timer, onSettled }
+
+function qtyOf(item) {
+  const edit = qtyEdits.get(item.id);
+  return edit ? toQty(item.qty + edit.inflight + edit.delta, 0) : item.qty;
+}
+
+const qtyLabel = (qty) => (qty ? `Осталось: <b>${qty}</b> шт.` : 'Закончилось');
+
+// Новое количество видно сразу, а сохраняется чуть позже. Возвращает то, что показать.
+function setQty(id, value, onSettled) {
+  const item = findItem(id);
+  if (!item) return 0;
+  const edit = qtyEdits.get(id) ?? { delta: 0, inflight: 0, timer: 0 };
+  edit.delta += toQty(value, 0) - qtyOf(item);
+  edit.onSettled = onSettled;
+  qtyEdits.set(id, edit);
+  clearTimeout(edit.timer);
+  edit.timer = setTimeout(() => {
+    edit.timer = 0;
+    flushQty(id);
+  }, store.kind === 'local' ? 0 : 800);
+  return qtyOf(item);
+}
+
+async function flushQty(id) {
+  const edit = qtyEdits.get(id);
+  if (!edit || edit.inflight) return; // запись уже идёт — остаток уйдёт следом
+  if (edit.delta) {
+    edit.inflight = edit.delta;
+    edit.delta = 0;
+    try {
+      await store.changeQty(id, edit.inflight);
+    } catch (err) {
+      toast(err.message, 'error');
+    }
+    edit.inflight = 0;
+  }
+  if (!edit.delta) qtyEdits.delete(id);
+  else if (!edit.timer) flushQty(id);
+  edit.onSettled?.();
+}
+
+function flushAllQty() {
+  for (const [id, edit] of qtyEdits) {
+    clearTimeout(edit.timer);
+    edit.timer = 0;
+    flushQty(id);
+  }
+}
+
+// Позицию удаляют или сохраняют из формы — накопленные −/+ больше не нужны.
+function dropQtyEdit(id) {
+  const edit = qtyEdits.get(id);
+  if (!edit) return;
+  clearTimeout(edit.timer);
+  edit.timer = 0;
+  edit.delta = 0;
+  if (!edit.inflight) qtyEdits.delete(id);
+}
+
+const stepper = (qty, attrs = '') => `
+  <div class="stepper">
+    <button type="button" class="step" data-step="-1" aria-label="Убрать 1 шт." ${qty > 0 ? '' : 'disabled'}>${icon('minus', 22)}</button>
+    <input type="number" inputmode="numeric" min="0" max="${MAX_QTY}" step="1" value="${qty}" ${attrs}>
+    <button type="button" class="step" data-step="1" aria-label="Добавить 1 шт.">${icon('plus', 22)}</button>
+  </div>`;
+
+// Поле количества с кнопками −1 и +1. onChange получает новое значение и возвращает то, что показать.
+function bindStepper(el, onChange) {
+  const input = el.querySelector('input');
+  const minus = el.querySelector('[data-step="-1"]');
+  let value = toQty(input.value, 0);
+  const show = (next) => {
+    value = next;
+    input.value = next;
+    minus.disabled = next <= 0;
+  };
+  const commit = (next) => show(onChange(toQty(next, value)));
+  el.addEventListener('click', (event) => {
+    const button = event.target.closest('[data-step]');
+    if (button) commit(value + Number(button.dataset.step));
+  });
+  input.addEventListener('change', () => commit(input.value));
+  input.addEventListener('keydown', (event) => {
+    if (event.key !== 'Enter') return;
+    event.preventDefault();
+    input.blur();
+  });
+  return show;
 }
 
 /* -------------------------------------------------------------- layout */
@@ -236,6 +333,7 @@ function errorScreen(err) {
 }
 
 function logout() {
+  flushAllQty();
   auth.logout();
   session = null;
   store = null;
@@ -268,8 +366,10 @@ app.addEventListener('click', (event) => {
 });
 
 // Вернулись во вкладку — подтягиваем изменения, сделанные с других устройств.
+// Уходим из вкладки — отправляем накопленные −/+, не дожидаясь паузы.
 document.addEventListener('visibilitychange', async () => {
-  if (document.visibilityState !== 'visible' || store?.kind !== 'github' || !loaded) return;
+  if (document.visibilityState === 'hidden') return flushAllQty();
+  if (store?.kind !== 'github' || !loaded) return;
   if (Date.now() - lastSync < 15_000) return;
   try {
     await sync();
@@ -337,10 +437,14 @@ function viewList() {
   const filtersEl = app.querySelector('.filters');
   const listEl = app.querySelector('[data-list]');
 
-  const draw = () => {
-    const all = store.items
-      .map((item) => ({ item, exp: expiry(item.expires) }))
-      .sort((a, b) => a.exp.left - b.exp.left || a.item.name.localeCompare(b.item.name, 'ru'));
+  const entries = () => store.items
+    .map((item) => {
+      const qty = qtyOf(item);
+      return { item, qty, exp: expiry(item.expires, qty > 0) };
+    })
+    .sort((a, b) => a.exp.left - b.exp.left || a.item.name.localeCompare(b.item.name, 'ru'));
+
+  const drawFilters = (all) => {
     const counts = {
       all: all.length,
       soon: all.filter((x) => x.exp.cls === 'exp-soon').length,
@@ -351,6 +455,44 @@ function viewList() {
         <button class="chip ${key !== 'all' && counts[key] ? 'alert' : ''}" data-filter="${key}" aria-pressed="${listState.filter === key}">
           ${label}<span class="count">${counts[key]}</span>
         </button>`).join('');
+  };
+
+  const row = ({ item, qty, exp }) => `
+      <li class="row ${qty ? '' : 'out'}" data-row="${esc(item.id)}">
+        <a class="row-link" href="#/item/${esc(item.id)}">
+          ${thumb(item)}
+          <div class="row-main">
+            <div class="row-name">${esc(item.name)}</div>
+            <div class="row-exp ${exp.cls}">${esc(exp.label)}</div>
+            <div class="row-qty ${qty ? '' : 'out'}">${qtyLabel(qty)}</div>
+          </div>
+        </a>
+        <button class="icon-btn row-del" data-del="${esc(item.id)}" aria-label="Удалить «${esc(item.name)}»">${icon('trash')}</button>
+        <div class="row-step" role="group" aria-label="Количество «${esc(item.name)}»">
+          <button class="step" data-step="-1" aria-label="Убрать 1 шт." ${qty ? '' : 'disabled'}>${icon('minus', 18)}</button>
+          <button class="step" data-step="1" aria-label="Добавить 1 шт.">${icon('plus', 18)}</button>
+        </div>
+      </li>`;
+
+  // После −/+ перерисовываем только саму строку, чтобы не мигали картинки остальных.
+  const refreshRow = (id) => {
+    const all = entries();
+    const entry = all.find((x) => x.item.id === id);
+    const li = listEl.querySelector(`[data-row="${CSS.escape(id)}"]`);
+    if (!entry || !li) return draw();
+    const { qty, exp } = entry;
+    li.classList.toggle('out', !qty);
+    li.querySelector('.row-exp').className = `row-exp ${exp.cls}`;
+    const left = li.querySelector('.row-qty');
+    left.className = `row-qty ${qty ? '' : 'out'}`;
+    left.innerHTML = qtyLabel(qty);
+    li.querySelector('[data-step="-1"]').disabled = !qty;
+    drawFilters(all);
+  };
+
+  const draw = () => {
+    const all = entries();
+    drawFilters(all);
 
     const query = listState.query.trim().toLowerCase();
     const shown = all.filter(({ item, exp }) =>
@@ -370,17 +512,7 @@ function viewList() {
       listEl.innerHTML = '<p class="nothing">Ничего не найдено</p>';
       return;
     }
-    listEl.innerHTML = `<ul class="list">${shown.map(({ item, exp }) => `
-      <li class="row">
-        <a class="row-link" href="#/item/${esc(item.id)}">
-          ${thumb(item)}
-          <div class="row-main">
-            <div class="row-name">${esc(item.name)}</div>
-            <div class="row-exp ${exp.cls}">${esc(exp.label)}</div>
-          </div>
-        </a>
-        <button class="icon-btn row-del" data-del="${esc(item.id)}" aria-label="Удалить «${esc(item.name)}»">${icon('trash')}</button>
-      </li>`).join('')}</ul>`;
+    listEl.innerHTML = `<ul class="list">${shown.map(row).join('')}</ul>`;
     hydrateImages(listEl);
   };
 
@@ -395,11 +527,21 @@ function viewList() {
     draw();
   });
   listEl.addEventListener('click', async (event) => {
+    const step = event.target.closest('[data-step]');
+    if (step) {
+      const { row: id } = step.closest('[data-row]').dataset;
+      const item = findItem(id);
+      if (!item) return;
+      setQty(id, qtyOf(item) + Number(step.dataset.step), () => refreshRow(id));
+      refreshRow(id);
+      return;
+    }
     const button = event.target.closest('[data-del]');
     const item = button && findItem(button.dataset.del);
     if (!item) return;
     const yes = await confirmDialog({ title: 'Удалить позицию?', text: `«${item.name}» пропадёт из списка.`, ok: 'Удалить', danger: true });
     if (!yes) return;
+    dropQtyEdit(item.id);
     if (await withBusy(button, () => store.remove(item.id, 'Удалено'))) {
       toast(`Удалено: ${item.name}`);
       draw();
@@ -418,7 +560,8 @@ function viewItem(id) {
     app.innerHTML = shell({ back: '#/', body: notFound() });
     return;
   }
-  const exp = expiry(item.expires);
+  const qty = qtyOf(item);
+  const exp = expiry(item.expires, qty > 0);
   app.innerHTML = shell({
     back: '#/',
     actions: `
@@ -429,6 +572,14 @@ function viewItem(id) {
       <h2 class="item-title">${esc(item.name)}</h2>
       <span class="badge ${exp.cls}">${icon('clock', 16)}${esc(exp.full)}</span>
       <p class="desc ${item.description ? '' : 'muted'}">${item.description ? esc(item.description) : 'Без описания'}</p>
+
+      <section class="section qty-block">
+        <div class="qty-head">
+          <h2>Количество, шт.</h2>
+          <span class="qty-out" ${qty ? 'hidden' : ''}>Закончилось</span>
+        </div>
+        ${stepper(qty, 'aria-label="Количество, шт."')}
+      </section>
 
       <section class="section qr-block">
         <div class="qr" data-qr></div>
@@ -441,7 +592,6 @@ function viewItem(id) {
 
       <div class="card-actions">
         <a class="btn btn-secondary" href="#/item/${esc(id)}/edit">${icon('edit')}Изменить</a>
-        <button class="btn btn-tonal" data-take>${icon('check')}Забрать</button>
       </div>
 
       <div class="print-label">
@@ -457,22 +607,34 @@ function viewItem(id) {
 
   app.querySelector('[data-print]').addEventListener('click', () => window.print());
 
-  const removeItem = async (button, verb) => {
-    const take = verb === 'Забрано';
-    const yes = await confirmDialog({
-      title: take ? 'Забрать позицию?' : 'Удалить позицию?',
-      text: `«${item.name}» пропадёт из списка.`,
-      ok: take ? 'Забрать' : 'Удалить',
-      danger: !take,
+  const badge = app.querySelector('.badge');
+  const outNote = app.querySelector('.qty-out');
+  const qtyInput = app.querySelector('.qty-block input');
+  const paint = (value) => {
+    outNote.hidden = value > 0;
+    badge.className = `badge ${expiry(item.expires, value > 0).cls}`;
+  };
+  const showQty = bindStepper(app.querySelector('.qty-block .stepper'), (value) => {
+    const next = setQty(id, value, () => {
+      const fresh = findItem(id);
+      if (!fresh || document.activeElement === qtyInput) return;
+      showQty(qtyOf(fresh));
+      paint(qtyOf(fresh));
     });
+    paint(next);
+    return next;
+  });
+
+  app.querySelector('[data-delete]').addEventListener('click', async (event) => {
+    const button = event.currentTarget;
+    const yes = await confirmDialog({ title: 'Удалить позицию?', text: `«${item.name}» пропадёт из списка.`, ok: 'Удалить', danger: true });
     if (!yes) return;
-    if (await withBusy(button, () => store.remove(id, verb))) {
-      toast(`${verb}: ${item.name}`);
+    dropQtyEdit(id);
+    if (await withBusy(button, () => store.remove(id, 'Удалено'))) {
+      toast(`Удалено: ${item.name}`);
       redirect('/');
     }
-  };
-  app.querySelector('[data-take]').addEventListener('click', (e) => removeItem(e.currentTarget, 'Забрано'));
-  app.querySelector('[data-delete]').addEventListener('click', (e) => removeItem(e.currentTarget, 'Удалено'));
+  });
 
   liveRefresh = () => render();
 }
@@ -506,6 +668,10 @@ function viewForm(id) {
         </label>
         <label class="field"><span>Название</span>
           <input name="name" required maxlength="120" placeholder="Например, молоко 3,2%" value="${esc(item?.name)}"></label>
+        <div class="field">
+          <label for="f-qty">Количество, шт.</label>
+          ${stepper(item ? qtyOf(item) : 1, 'id="f-qty" name="qty"')}
+        </div>
         <div class="field">
           <label for="f-expires">Срок годности</label>
           <input id="f-expires" name="expires" type="date" value="${esc(item?.expires)}">
@@ -562,10 +728,14 @@ function viewForm(id) {
     expiresInput.value = toISODate(date);
   });
 
-  formHandler('item', async ({ name, expires, description }) => {
+  bindStepper(app.querySelector('.page-form .stepper'), (value) => value);
+
+  formHandler('item', async ({ name, qty, expires, description }) => {
     name = name.trim();
     if (!name) throw new Error('Введите название');
-    const saved = await store.upsert({ id: item?.id || newId(), name, expires, description: description.trim() }, image);
+    if (item) dropQtyEdit(item.id);
+    const fields = { id: item?.id || newId(), name, qty: toQty(qty), expires, description: description.trim() };
+    const saved = await store.upsert(fields, image);
     toast(item ? 'Сохранено' : `Добавлено: ${name}`);
     location.replace(`#/item/${saved.id}`);
   });
@@ -608,7 +778,8 @@ function viewScan() {
   };
 
   const openSheet = (item) => {
-    const exp = expiry(item.expires);
+    const qty = qtyOf(item);
+    const exp = expiry(item.expires, qty > 0);
     sheet.innerHTML = `
       <div class="sheet" role="dialog" aria-label="Найдена позиция"><div class="sheet-inner">
         <div class="sheet-item">
@@ -616,9 +787,10 @@ function viewScan() {
           <div class="row-main">
             <div class="row-name">${esc(item.name)}</div>
             <div class="row-exp ${exp.cls}">${esc(exp.label)}</div>
+            <div class="row-qty ${qty ? '' : 'out'}">${qtyLabel(qty)}</div>
           </div>
         </div>
-        <button class="btn btn-primary btn-block" data-take>${icon('check')}Забрать</button>
+        <button class="btn btn-primary btn-block" data-take ${qty ? '' : 'disabled'}>${icon('check')}${qty ? 'Забрать 1 шт.' : 'Закончилось'}</button>
         <div class="sheet-row">
           <a class="btn btn-secondary" href="#/item/${esc(item.id)}">Карточка</a>
           <button class="btn btn-secondary" data-cancel>Отмена</button>
@@ -627,8 +799,9 @@ function viewScan() {
     hydrateImages(sheet);
     sheet.querySelector('[data-cancel]').addEventListener('click', () => closeSheet());
     sheet.querySelector('[data-take]').addEventListener('click', async (event) => {
-      if (await withBusy(event.currentTarget, () => store.remove(item.id, 'Забрано'))) {
-        toast(`Забрано: ${item.name}`);
+      const saved = await withBusy(event.currentTarget, () => store.changeQty(item.id, -1, 'Забрано'));
+      if (saved) {
+        toast(`Забрано: ${item.name} · ${saved.qty ? `осталось ${saved.qty} шт.` : 'больше не осталось'}`);
         closeSheet('Готово. Можно сканировать следующую позицию');
       }
     });
@@ -638,7 +811,7 @@ function viewScan() {
     const id = parseItemCode(text);
     const item = id && findItem(id);
     if (!item) {
-      setStatus(id ? 'Эта позиция уже забрана или удалена' : 'Это не QR-код Кладовой', true);
+      setStatus(id ? 'Этой позиции уже нет в списке' : 'Это не QR-код Кладовой', true);
       return;
     }
     scanner?.pause();
