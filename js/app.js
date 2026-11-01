@@ -495,7 +495,6 @@ function viewList() {
   app.innerHTML = shell({
     actions: `${local ? '' : `<button class="icon-btn" data-action="sync" aria-label="Обновить">${icon('refresh')}</button>`}${settingsLink()}`,
     body: `
-      ${local ? `<div class="banner">${icon('device')}<div>Сейчас данные хранятся только в этом браузере. <a href="#/settings">Создайте общую кладовую</a>, чтобы вести её вместе с ${esc(othersText())} с любого устройства.</div></div>` : ''}
       <label class="search">${icon('search')}<input type="search" placeholder="Поиск по названию и описанию" aria-label="Поиск" value="${esc(listState.query)}"></label>
       <div class="filters" role="group" aria-label="Фильтр"></div>
       <div data-list></div>`,
