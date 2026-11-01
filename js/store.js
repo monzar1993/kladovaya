@@ -1,8 +1,10 @@
 import { textToB64, b64ToText } from './crypto.js';
 
-// Формат позиции: { id, name, description, qty, expires: 'YYYY-MM-DD' | '', image, imageSha, createdAt, updatedAt }
+// Формат позиции: { id, name, description, qty, expires: 'YYYY-MM-DD' | '', image, imageSha,
+//                   createdAt, createdBy, updatedAt, updatedBy }
 // image — data URL (локальный режим) или путь к файлу в репозитории (режим GitHub).
 // qty — сколько штук осталось; у позиций, записанных до появления поля, считаем 1.
+// createdBy / updatedBy — кто из пользователей добавил и последним изменил позицию.
 
 const LOCAL_DB = 'pantry.local.db';
 const API = 'https://api.github.com';
@@ -46,6 +48,10 @@ export class LocalStore {
   kind = 'local';
   items = [];
 
+  constructor({ user = '' } = {}) {
+    this.user = user;
+  }
+
   async refresh() {
     this.items = normalize(readJSON(LOCAL_DB)?.items);
   }
@@ -61,7 +67,8 @@ export class LocalStore {
 
   async upsert(fields, image) {
     const prev = this.items.find((i) => i.id === fields.id);
-    const item = { image: '', createdAt: nowIso(), ...prev, ...fields, updatedAt: nowIso() };
+    const now = nowIso();
+    const item = { image: '', createdAt: now, createdBy: this.user, ...prev, ...fields, updatedAt: now, updatedBy: this.user };
     if (image !== undefined) item.image = image || '';
     this.#save(upsertIn([...this.items], item));
     return item;
@@ -121,8 +128,8 @@ export class GitHubStore {
   #images = new Map(); // путь → URL картинки (или промис URL)
   #queue = Promise.resolve();
 
-  constructor({ owner, repo, branch = 'main', token, dataDir = 'data' }) {
-    Object.assign(this, { owner, repo, branch, token, dataDir });
+  constructor({ owner, repo, branch = 'main', token, dataDir = 'data', user = '' }) {
+    Object.assign(this, { owner, repo, branch, token, dataDir, user });
     this.dbPath = `${dataDir}/db.json`;
     this.authPath = `${dataDir}/auth.json`;
   }
@@ -146,6 +153,11 @@ export class GitHubStore {
 
   #ref() {
     return `?ref=${encodeURIComponent(this.branch)}`;
+  }
+
+  // В истории репозитория видно, кто что сделал: «[Anna] Забрано 1 шт.: Молоко».
+  #message(text) {
+    return this.user ? `[${this.user}] ${text}` : text;
   }
 
   // Записи идут строго по очереди: параллельные коммиты в одну ветку GitHub отклоняет.
@@ -188,7 +200,7 @@ export class GitHubStore {
   #putFile(path, contentB64, message, sha) {
     return this.#api(`/contents/${path}`, {
       method: 'PUT',
-      body: { message, content: contentB64, branch: this.branch, ...(sha ? { sha } : {}) },
+      body: { message: this.#message(message), content: contentB64, branch: this.branch, ...(sha ? { sha } : {}) },
     });
   }
 
@@ -201,7 +213,7 @@ export class GitHubStore {
   async #deleteFile(path, sha, message) {
     sha ||= await this.#fileSha(path);
     if (!sha) return;
-    const res = await this.#api(`/contents/${path}`, { method: 'DELETE', body: { message, sha, branch: this.branch } });
+    const res = await this.#api(`/contents/${path}`, { method: 'DELETE', body: { message: this.#message(message), sha, branch: this.branch } });
     if (!res.ok && res.status !== 404) throw await apiError(res);
   }
 
@@ -234,7 +246,10 @@ export class GitHubStore {
   upsert(fields, image) {
     return this.#enqueue(async () => {
       const prev = this.items.find((i) => i.id === fields.id);
-      const item = { image: '', imageSha: '', createdAt: nowIso(), ...prev, ...fields, updatedAt: nowIso() };
+      const now = nowIso();
+      const item = {
+        image: '', imageSha: '', createdAt: now, createdBy: this.user, ...prev, ...fields, updatedAt: now, updatedBy: this.user,
+      };
       const oldImage = image !== undefined && prev?.image ? { path: prev.image, sha: prev.imageSha } : null;
       if (image) Object.assign(item, await this.#uploadImage(item.id, image, item.name));
       else if (image === null) Object.assign(item, { image: '', imageSha: '' });
@@ -253,7 +268,7 @@ export class GitHubStore {
       await this.#commitItems((items) => {
         item = items.find((i) => i.id === id);
         if (!item) throw new Error('Позиция уже удалена');
-        Object.assign(item, { qty: toQty(item.qty + delta), updatedAt: nowIso() });
+        Object.assign(item, { qty: toQty(item.qty + delta), updatedAt: nowIso(), updatedBy: this.user });
         return items;
       }, `${verb} ${Math.abs(delta)} шт.: ${name}`);
       return item;
@@ -277,7 +292,7 @@ export class GitHubStore {
     return this.#enqueue(async () => {
       const uploaded = [];
       for (const local of localItems) {
-        const item = { ...local, imageSha: '' };
+        const item = { createdBy: this.user, ...local, imageSha: '' };
         if (item.image?.startsWith('data:')) Object.assign(item, await this.#uploadImage(item.id, item.image, item.name));
         uploaded.push(item);
       }
@@ -316,6 +331,6 @@ export class GitHubStore {
 
 export function createStore(session, cfg) {
   return session.mode === 'github'
-    ? new GitHubStore({ ...session, dataDir: cfg.dataDir })
-    : new LocalStore();
+    ? new GitHubStore({ ...session, dataDir: cfg.dataDir, user: session.login })
+    : new LocalStore({ user: session.login });
 }

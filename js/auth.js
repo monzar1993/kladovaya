@@ -1,12 +1,15 @@
-import { seal, unseal } from './crypto.js';
+import { seal, unseal, randomKey, keyId } from './crypto.js';
 import { GitHubStore } from './store.js';
 
-const DEFAULT_LOGIN = 'admin';
-const DEFAULT_PASSWORD = 'admin';
+const DEFAULT_PASSWORD = '149';
 
 const SESSION = 'pantry.session';
-const LOCAL_AUTH = 'pantry.local.auth';   // зашифрованный пустой ящик: пароль для локального режима
-const REMOTE_AUTH = 'pantry.remote.auth'; // копия data/auth.json из репозитория
+const LAST_USER = 'pantry.user';
+const LOCAL_AUTH = 'pantry.local.password'; // зашифрованный пустой ящик: общий пароль для локального режима
+const REMOTE_AUTH = 'pantry.remote.auth';   // копия data/auth.json из репозитория
+const SPACE_KEY = 'pantry.key';             // ключ кладовой из ссылки-приглашения
+
+export const INVITE_NEEDED = 'Это устройство ещё не подключено к общей кладовой. Откройте на нём ссылку-приглашение.';
 
 function readJSON(key) {
   try {
@@ -17,7 +20,7 @@ function readJSON(key) {
 }
 
 export function resolveConfig() {
-  const cfg = { owner: '', repo: '', branch: 'main', dataDir: 'data', warnDays: 3, ...window.PANTRY_CONFIG };
+  const cfg = { owner: '', repo: '', branch: 'main', dataDir: 'data', warnDays: 3, users: ['Igor', 'Anna'], ...window.PANTRY_CONFIG };
   const host = location.hostname;
   if (host.endsWith('.github.io')) {
     cfg.owner ||= host.slice(0, -'.github.io'.length);
@@ -28,9 +31,11 @@ export function resolveConfig() {
 }
 
 export const getSession = () => readJSON(SESSION);
+export const lastUser = () => localStorage.getItem(LAST_USER) || '';
 
 function saveSession(session) {
   localStorage.setItem(SESSION, JSON.stringify(session));
+  localStorage.setItem(LAST_USER, session.login);
   return session;
 }
 
@@ -38,11 +43,26 @@ export function logout() {
   localStorage.removeItem(SESSION);
 }
 
-export const isWeak = (login, password) =>
-  password.length < 8 || password === login || password === DEFAULT_PASSWORD;
+/* -------------------------------------------------------------- invite */
 
-// data/auth.json хранит токен GitHub, зашифрованный логином и паролем.
-// Сначала берём его через API (свежая версия сразу после коммита), затем с самого сайта
+// Токен в data/auth.json зашифрован паролем и ключом кладовой. Пароль короткий, его можно подобрать,
+// а ключа в репозитории нет: он приходит на устройство только по ссылке-приглашению.
+const spaceKey = () => localStorage.getItem(SPACE_KEY) || '';
+
+export function joinSpace(key) {
+  localStorage.setItem(SPACE_KEY, key);
+}
+
+export const inviteUrl = () => `${location.origin}${location.pathname}#/join/${spaceKey()}`;
+
+async function hasKeyFor(box) {
+  const key = spaceKey();
+  return Boolean(key && box?.kid && box.kid === await keyId(key));
+}
+
+/* --------------------------------------------------------------- login */
+
+// Сначала берём data/auth.json через API (свежая версия сразу после коммита), затем с самого сайта
 // (работает и для приватного репозитория), затем копию, сохранённую при прошлом входе.
 async function fetchRemoteAuth(cfg) {
   const sources = [];
@@ -66,60 +86,67 @@ async function fetchRemoteAuth(cfg) {
   return readJSON(REMOTE_AUTH);
 }
 
-async function checkLocal(login, password) {
+async function checkLocal(password) {
   const box = readJSON(LOCAL_AUTH);
-  if (!box) return login === DEFAULT_LOGIN && password === DEFAULT_PASSWORD;
-  return (await unseal(login, password, box)) !== null;
+  if (!box) return password === DEFAULT_PASSWORD;
+  return (await unseal('local', password, box)) !== null;
 }
 
-// 'github' — вход откроет данные из репозитория; 'local' — пароль уже менялся; 'fresh' — admin/admin.
+// 'github' — вход откроет общую кладовую; 'invite' — она есть, но на этом устройстве нет ключа из приглашения;
+// 'local' — общей кладовой ещё нет, данные хранятся в этом браузере.
 export async function probe(cfg) {
-  if (await fetchRemoteAuth(cfg)) return 'github';
-  return readJSON(LOCAL_AUTH) ? 'local' : 'fresh';
+  const remote = await fetchRemoteAuth(cfg);
+  if (!remote) return 'local';
+  return (await hasKeyFor(remote)) ? 'github' : 'invite';
 }
 
-export async function login(cfg, login, password) {
+export async function login(cfg, user, password) {
+  if (!cfg.users.includes(user)) throw new Error('Выберите, кто входит');
   const remote = await fetchRemoteAuth(cfg);
   if (remote) {
-    const secret = await unseal(login, password, remote);
-    if (!secret?.token) throw new Error('Неверный логин или пароль');
+    if (!(await hasKeyFor(remote))) throw new Error(INVITE_NEEDED);
+    const secret = await unseal(spaceKey(), password, remote);
+    if (!secret?.token) throw new Error('Неверный пароль');
     localStorage.setItem(REMOTE_AUTH, JSON.stringify(remote));
     return saveSession({
       mode: 'github',
-      login,
+      login: user,
       token: secret.token,
       owner: remote.owner || cfg.owner,
       repo: remote.repo || cfg.repo,
       branch: remote.branch || cfg.branch,
-      weak: isWeak(login, password),
     });
   }
-  if (!(await checkLocal(login, password))) throw new Error('Неверный логин или пароль');
-  return saveSession({ mode: 'local', login, weak: isWeak(login, password) });
+  if (!(await checkLocal(password))) throw new Error('Неверный пароль');
+  return saveSession({ mode: 'local', login: user });
 }
 
-export async function connectGitHub(cfg, { owner, repo, branch, token, login, password }) {
-  const store = new GitHubStore({ owner, repo, branch, token, dataDir: cfg.dataDir });
+/* ------------------------------------------------------------- setup */
+
+// newKey — выдать новый ключ: старые ссылки-приглашения перестанут работать.
+export async function connectGitHub(cfg, session, { owner, repo, branch, token, password, newKey }) {
+  const store = new GitHubStore({ owner, repo, branch, token, dataDir: cfg.dataDir, user: session.login });
   await store.checkRepo();
-  const box = { ...(await seal(login, password, { token })), owner, repo, branch };
+  const key = session.mode === 'github' && !newKey && spaceKey() ? spaceKey() : randomKey();
+  const box = { ...(await seal(key, password, { token })), kid: await keyId(key), owner, repo, branch };
   await store.writeAuth(box);
   await store.refresh();
+  joinSpace(key);
   localStorage.setItem(REMOTE_AUTH, JSON.stringify(box));
-  const session = saveSession({ mode: 'github', login, token, owner, repo, branch, weak: isWeak(login, password) });
-  return { session, store };
+  const next = saveSession({ mode: 'github', login: session.login, token, owner, repo, branch });
+  return { session: next, store };
 }
 
-export async function changeCredentials(session, store, currentPassword, login, password) {
+export async function changePassword(cfg, session, store, current, password) {
   if (session.mode === 'github') {
-    const box = readJSON(REMOTE_AUTH);
-    if (!box || !(await unseal(session.login, currentPassword, box))) throw new Error('Текущий пароль указан неверно');
-    const { owner, repo, branch, token } = session;
-    const next = { ...(await seal(login, password, { token })), owner, repo, branch };
+    const box = await fetchRemoteAuth(cfg);
+    const secret = box && (await hasKeyFor(box)) ? await unseal(spaceKey(), current, box) : null;
+    if (!secret?.token) throw new Error('Текущий пароль указан неверно');
+    const next = { ...(await seal(spaceKey(), password, secret)), kid: box.kid, owner: box.owner, repo: box.repo, branch: box.branch };
     await store.writeAuth(next);
     localStorage.setItem(REMOTE_AUTH, JSON.stringify(next));
   } else {
-    if (!(await checkLocal(session.login, currentPassword))) throw new Error('Текущий пароль указан неверно');
-    localStorage.setItem(LOCAL_AUTH, JSON.stringify(await seal(login, password, {})));
+    if (!(await checkLocal(current))) throw new Error('Текущий пароль указан неверно');
+    localStorage.setItem(LOCAL_AUTH, JSON.stringify(await seal('local', password, {})));
   }
-  return saveSession({ ...session, login, weak: isWeak(login, password) });
 }

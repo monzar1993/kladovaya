@@ -9,6 +9,11 @@ const app = document.getElementById('app');
 const NEXT_KEY = 'pantry.next';
 
 let session = auth.getSession();
+// Сессия со старым логином (admin) или с пользователем, которого убрали из config.js, — входим заново.
+if (session && !cfg.users.includes(session.login)) {
+  auth.logout();
+  session = null;
+}
 let store = session ? createStore(session, cfg) : null;
 let loaded = false;
 let lastSync = 0;
@@ -62,6 +67,31 @@ function expiry(expires, active = true) {
   const long = date.toLocaleDateString('ru-RU', { day: 'numeric', month: 'long', year: 'numeric' });
   return { left, cls, label: `до ${date.toLocaleDateString('ru-RU')} · ${rel}`, full: `Годен до ${long} · ${rel}` };
 }
+
+// «сегодня в 14:05», «вчера в 09:30», «1 ноября»
+function when(iso) {
+  const date = new Date(iso);
+  if (Number.isNaN(date.getTime())) return '';
+  const day = new Date(date);
+  day.setHours(0, 0, 0, 0);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const diff = Math.round((today - day) / 86_400_000);
+  const time = date.toLocaleTimeString('ru-RU', { hour: '2-digit', minute: '2-digit' });
+  if (diff === 0) return `сегодня в ${time}`;
+  if (diff === 1) return `вчера в ${time}`;
+  return date.toLocaleDateString('ru-RU', {
+    day: 'numeric', month: 'long', ...(day.getFullYear() === today.getFullYear() ? {} : { year: 'numeric' }),
+  });
+}
+
+// Кружок с первой буквой имени; у каждого пользователя свой цвет.
+function avatar(name, cls = '') {
+  const tone = Math.max(cfg.users.indexOf(name), 0) % 2;
+  return `<span class="avatar ${cls}" data-tone="${tone}" aria-hidden="true">${esc(name.charAt(0).toUpperCase())}</span>`;
+}
+
+const othersText = () => cfg.users.filter((name) => name !== session.login).join(', ');
 
 function thumb(item, cls = 'thumb') {
   const letter = esc((item.name || '?').trim().charAt(0).toUpperCase());
@@ -260,7 +290,8 @@ function shell({ title = '', back = '', actions = '', body = '', dock = true, pa
     </div></nav>` : ''}`;
 }
 
-const settingsLink = `<a class="icon-btn" href="#/settings" aria-label="Настройки">${icon('settings')}</a>`;
+// Вместо шестерёнки — кружок пользователя: сразу видно, под кем сделан вход.
+const settingsLink = () => `<a class="icon-btn account" href="#/settings" aria-label="Настройки · ${esc(session.login)}">${avatar(session.login)}</a>`;
 
 const notFound = () => `
   <div class="empty">
@@ -288,6 +319,8 @@ async function render() {
   teardown = null;
   liveRefresh = null;
   const path = currentPath();
+  const invite = /^\/join\/([\w-]{43})$/.exec(path);
+  if (invite) return acceptInvite(invite[1]);
   const route = routes.find((r) => r.re.test(path));
   if (!route) return redirect('/');
   if (!session && !route.guest) {
@@ -316,7 +349,7 @@ async function sync() {
 
 function errorScreen(err) {
   return shell({
-    actions: settingsLink,
+    actions: settingsLink(),
     dock: false,
     body: `
       <div class="empty">
@@ -341,6 +374,19 @@ function logout() {
   listState.query = '';
   listState.filter = 'all';
   redirect('/login');
+}
+
+// Ссылка-приглашение кладёт на устройство ключ общей кладовой, после чего можно войти.
+function acceptInvite(key) {
+  auth.joinSpace(key);
+  if (session?.mode === 'github') {
+    toast('Ссылка-приглашение сохранена');
+    return redirect('/');
+  }
+  // локальная сессия показала бы список этого браузера — входим заново, уже в общую кладовую
+  if (session) logout();
+  else redirect('/login');
+  toast('Приглашение принято. Выберите себя и введите пароль');
 }
 
 const actions = {
@@ -382,6 +428,7 @@ document.addEventListener('visibilitychange', async () => {
 /* --------------------------------------------------------------- login */
 
 function viewLogin() {
+  const last = auth.lastUser();
   app.innerHTML = `
     <main class="login">
       <div class="login-card">
@@ -389,28 +436,50 @@ function viewLogin() {
         <h1>Кладовая</h1>
         <p class="muted">Учёт продуктов дома</p>
         <form class="form" data-form="login">
-          <label class="field"><span>Логин</span>
-            <input name="login" required autocomplete="username" autocapitalize="none" spellcheck="false"></label>
+          <fieldset class="who">
+            <legend>Кто входит</legend>
+            <div class="who-options">
+              ${cfg.users.map((name) => `
+                <label class="who-option">
+                  <input type="radio" name="user" value="${esc(name)}" required ${name === last ? 'checked' : ''}>
+                  ${avatar(name)}<span>${esc(name)}</span>
+                </label>`).join('')}
+            </div>
+          </fieldset>
           <label class="field"><span>Пароль</span>
             <input name="password" type="password" required autocomplete="current-password"></label>
           <p class="form-error" hidden></p>
           <button class="btn btn-primary btn-block">Войти</button>
         </form>
+        <div class="join-note" hidden>
+          <span class="status-icon">${icon('link', 22)}</span>
+          <div>
+            <b>Нужна ссылка-приглашение</b>
+            <p>Общая кладовая уже создана. Откройте на этом устройстве ссылку-приглашение или наведите камеру
+              на QR-код из настроек — его можно показать с устройства, где кладовая уже открыта.</p>
+          </div>
+        </div>
         <p class="hint login-hint" data-hint>&nbsp;</p>
       </div>
     </main>`;
 
+  const form = app.querySelector('[data-form="login"]');
+  const password = form.elements.namedItem('password');
+  form.querySelector('.who').addEventListener('change', () => password.focus());
+
   const hint = app.querySelector('[data-hint]');
   auth.probe(cfg).then((mode) => {
     hint.textContent = {
-      fresh: 'Первый вход: admin / admin',
-      local: 'Данные хранятся в этом браузере',
-      github: 'Данные синхронизируются через GitHub',
+      local: 'Пока данные хранятся только в этом браузере',
+      github: `Общая кладовая: ${cfg.users.join(' и ')}`,
+      invite: '',
     }[mode];
+    form.hidden = mode === 'invite';
+    app.querySelector('.join-note').hidden = mode !== 'invite';
   });
 
-  formHandler('login', async ({ login, password }) => {
-    session = await auth.login(cfg, login.trim(), password);
+  formHandler('login', async ({ user, password: value }) => {
+    session = await auth.login(cfg, user, value);
     store = createStore(session, cfg);
     loaded = false;
     const next = sessionStorage.getItem(NEXT_KEY) || '/';
@@ -424,10 +493,9 @@ function viewLogin() {
 function viewList() {
   const local = store.kind === 'local';
   app.innerHTML = shell({
-    actions: `${local ? '' : `<button class="icon-btn" data-action="sync" aria-label="Обновить">${icon('refresh')}</button>`}${settingsLink}`,
+    actions: `${local ? '' : `<button class="icon-btn" data-action="sync" aria-label="Обновить">${icon('refresh')}</button>`}${settingsLink()}`,
     body: `
-      ${local ? `<div class="banner">${icon('device')}<div>Сейчас данные хранятся только в этом браузере. <a href="#/settings">Подключите GitHub</a>, чтобы открывать кладовую с любого устройства.</div></div>` : ''}
-      ${!local && session.weak ? `<div class="banner warn">${icon('alert')}<div>Вход защищён слабым паролем — его легко подобрать. <a href="#/settings">Сменить пароль</a></div></div>` : ''}
+      ${local ? `<div class="banner">${icon('device')}<div>Сейчас данные хранятся только в этом браузере. <a href="#/settings">Создайте общую кладовую</a>, чтобы вести её вместе с ${esc(othersText())} с любого устройства.</div></div>` : ''}
       <label class="search">${icon('search')}<input type="search" placeholder="Поиск по названию и описанию" aria-label="Поиск" value="${esc(listState.query)}"></label>
       <div class="filters" role="group" aria-label="Фильтр"></div>
       <div data-list></div>`,
@@ -562,6 +630,10 @@ function viewItem(id) {
   }
   const qty = qtyOf(item);
   const exp = expiry(item.expires, qty > 0);
+  const history = [
+    item.createdBy && `Добавлено: <b>${esc(item.createdBy)}</b>, ${when(item.createdAt)}`,
+    item.updatedBy && item.updatedAt !== item.createdAt && `Изменено: <b>${esc(item.updatedBy)}</b>, ${when(item.updatedAt)}`,
+  ].filter(Boolean);
   app.innerHTML = shell({
     back: '#/',
     actions: `
@@ -593,6 +665,7 @@ function viewItem(id) {
       <div class="card-actions">
         <a class="btn btn-secondary" href="#/item/${esc(id)}/edit">${icon('edit')}Изменить</a>
       </div>
+      ${history.length ? `<p class="item-meta">${history.map((line) => `<span>${line}</span>`).join('')}</p>` : ''}
 
       <div class="print-label">
         <div class="qr" data-qr></div>
@@ -863,29 +936,53 @@ function viewScan() {
 
 /* ------------------------------------------------------------ settings */
 
+// Ссылка на создание токена с уже заполненными названием, сроком и правом на запись.
+const tokenUrl = (owner) => `https://github.com/settings/personal-access-tokens/new?${new URLSearchParams({
+  name: 'Кладовая',
+  description: 'Запись списка продуктов из приложения «Кладовая»',
+  ...(owner ? { target_name: owner } : {}),
+  expires_in: '366',
+  contents: 'write',
+})}`;
+
 function viewSettings() {
   const gh = store.kind === 'github';
   const target = gh ? store : cfg;
+  const touch = Boolean(navigator.share) && matchMedia('(pointer: coarse)').matches;
   app.innerHTML = shell({
     back: '#/',
     title: 'Настройки',
     body: `
       <section class="section status">
-        <span class="status-icon">${icon(gh ? 'cloud' : 'device', 22)}</span>
+        ${avatar(session.login, 'lg')}
         <div>
-          <b>${gh ? 'Синхронизация через GitHub' : 'Только этот браузер'}</b>
+          <b>${esc(session.login)}</b>
           <div class="hint">${gh
-            ? `<a href="${esc(store.repoUrl)}" target="_blank" rel="noopener">${esc(store.owner)}/${esc(store.repo)}</a> · ветка ${esc(store.branch)}`
-            : 'Другие устройства этих данных не видят'}</div>
+            ? `Общая кладовая · <a href="${esc(store.repoUrl)}" target="_blank" rel="noopener">${esc(store.owner)}/${esc(store.repo)}</a>`
+            : 'Данные только в этом браузере'}</div>
         </div>
       </section>
 
+      ${gh ? `
+      <section class="section qr-block invite">
+        <div class="qr" data-invite-qr></div>
+        <div class="qr-meta">
+          <h3>Ссылка-приглашение</h3>
+          <p>Для ${esc(othersText())} и для ваших других устройств: наведите камеру на код или откройте ссылку, затем войдите своим именем и общим паролем. Отправляйте её только своим.</p>
+          <button class="btn btn-secondary" data-invite>${touch ? `${icon('share')}Отправить ссылку` : `${icon('copy')}Скопировать ссылку`}</button>
+        </div>
+      </section>` : ''}
+
       <section class="section">
-        <h2>${gh ? 'Заменить токен или репозиторий' : 'Подключить GitHub'}</h2>
-        <p>Данные будут храниться в репозитории с этим сайтом: список — в <code>${esc(cfg.dataDir)}/db.json</code>, фото — в <code>${esc(cfg.dataDir)}/img/</code>.</p>
+        <h2>${gh ? 'Заменить токен' : 'Создать общую кладовую'}</h2>
+        ${gh ? '' : `<div class="banner warn" data-exists hidden>${icon('alert')}<div>В репозитории уже есть общая кладовая. Чтобы подключиться к ней, откройте ссылку-приглашение с устройства, где она открыта. Если создать кладовую здесь, данные сохранятся, но старые ссылки-приглашения перестанут работать.</div></div>`}
+        <p>${gh
+          ? 'Когда срок токена истечёт, создайте новый и вставьте его сюда.'
+          : `Чтобы вести кладовую вместе с ${esc(othersText())} с любых устройств, данные будут храниться в репозитории с этим сайтом: список — в <code>${esc(cfg.dataDir)}/db.json</code>, фото — в <code>${esc(cfg.dataDir)}/img/</code>.`}</p>
         <ol class="steps">
-          <li>Создайте <a href="https://github.com/settings/personal-access-tokens/new" target="_blank" rel="noopener">fine-grained токен</a>: доступ только к этому репозиторию, право <b>Contents: Read and write</b>.</li>
-          <li>Вставьте его ниже и задайте логин и пароль — с ними вы будете входить с любого устройства. Токен сохранится в репозитории только в зашифрованном этим паролем виде.</li>
+          <li>Создайте <a href="${esc(tokenUrl(target.owner))}" target="_blank" rel="noopener">токен GitHub</a> — название и право на запись уже заполнены. В <b>Repository access</b> выберите <b>Only select repositories</b> → <b>${esc(target.repo || 'этот репозиторий')}</b> и нажмите <b>Generate token</b>.</li>
+          <li>Вставьте токен ниже и задайте общий пароль для ${esc(cfg.users.join(' и '))}. Токен сохранится в репозитории только в зашифрованном виде: расшифровать его можно паролем и ключом из ссылки-приглашения.</li>
+          ${gh ? '' : '<li>Откройте ссылку-приглашение, которая появится здесь, на остальных устройствах.</li>'}
         </ol>
         <form class="form" data-form="connect">
           <div class="grid-2">
@@ -898,25 +995,22 @@ function viewSettings() {
             <input name="branch" required value="${esc(target.branch || 'main')}" autocapitalize="none" spellcheck="false"></label>
           <label class="field"><span>Токен</span>
             <input name="token" type="password" required placeholder="github_pat_…" autocomplete="off" spellcheck="false"></label>
-          <div class="grid-2">
-            <label class="field"><span>Логин</span>
-              <input name="login" required value="${esc(session.login)}" autocomplete="username" autocapitalize="none" spellcheck="false"></label>
-            <label class="field"><span>Пароль</span>
-              <input name="password" type="password" required autocomplete="new-password"></label>
-          </div>
+          <label class="field"><span>Общий пароль</span>
+            <input name="password" type="password" required autocomplete="new-password"></label>
+          ${gh ? '<label class="check"><input type="checkbox" name="newKey"><span>Выдать новую ссылку-приглашение — старые перестанут работать</span></label>' : ''}
           <p class="form-error" hidden></p>
-          <button class="btn btn-primary btn-block">${gh ? 'Сохранить' : 'Подключить'}</button>
+          <button class="btn btn-primary btn-block">${gh ? 'Сохранить' : 'Создать'}</button>
         </form>
       </section>
 
       <section class="section">
-        <h2>Логин и пароль</h2>
-        <p>${gh ? 'Пароль шифрует доступ к репозиторию, поэтому лучше сделать его длинным.' : 'Пароль для входа в этом браузере.'}</p>
+        <h2>Общий пароль</h2>
+        <p>${gh
+          ? `Один на всех: ${esc(cfg.users.join(', '))}. После смены входите новым паролем на всех устройствах.`
+          : 'Пароль для входа в этом браузере.'}</p>
         <form class="form" data-form="password">
           <label class="field"><span>Текущий пароль</span>
             <input name="current" type="password" required autocomplete="current-password"></label>
-          <label class="field"><span>Новый логин</span>
-            <input name="login" required value="${esc(session.login)}" autocomplete="username" autocapitalize="none" spellcheck="false"></label>
           <div class="grid-2">
             <label class="field"><span>Новый пароль</span>
               <input name="password" type="password" required autocomplete="new-password"></label>
@@ -931,18 +1025,37 @@ function viewSettings() {
       <button class="btn btn-ghost btn-block" data-action="logout">${icon('logout')}Выйти</button>`,
   });
 
+  if (gh) {
+    const url = auth.inviteUrl();
+    const qr = app.querySelector('[data-invite-qr]');
+    qrSvg(url).then((svg) => { qr.innerHTML = svg; }).catch((err) => { qr.textContent = err.message; });
+    app.querySelector('[data-invite]').addEventListener('click', async () => {
+      if (touch) {
+        try {
+          await navigator.share({ title: 'Кладовая', text: 'Приглашение в общую кладовую', url });
+        } catch {
+          // окно «Поделиться» закрыли
+        }
+        return;
+      }
+      try {
+        await navigator.clipboard.writeText(url);
+        toast('Ссылка скопирована');
+      } catch {
+        window.prompt('Скопируйте ссылку-приглашение', url);
+      }
+    });
+  } else {
+    auth.probe(cfg).then((mode) => {
+      const note = app.querySelector('[data-exists]');
+      if (note) note.hidden = mode === 'local';
+    });
+  }
+
   formHandler('connect', async (data) => {
     const fields = Object.fromEntries(Object.entries(data).map(([k, v]) => [k, k === 'password' ? v : v.trim()]));
-    if (auth.isWeak(fields.login, fields.password)) {
-      const yes = await confirmDialog({
-        title: 'Пароль слабый',
-        text: 'Зашифрованный токен лежит в публичном репозитории, и простой пароль к нему легко подобрать. Всё равно продолжить?',
-        ok: 'Продолжить',
-        danger: true,
-      });
-      if (!yes) return;
-    }
-    const connected = await auth.connectGitHub(cfg, fields);
+    const fresh = !gh || Boolean(data.newKey);
+    const connected = await auth.connectGitHub(cfg, session, { ...fields, newKey: Boolean(data.newKey) });
     session = connected.session;
     store = connected.store;
     loaded = true;
@@ -950,10 +1063,10 @@ function viewSettings() {
 
     const local = new LocalStore();
     await local.refresh();
-    if (local.items.length) {
+    if (!gh && local.items.length) {
       const move = await confirmDialog({
         title: 'Перенести данные?',
-        text: `В этом браузере есть позиции (${local.items.length}). Перенести их в GitHub?`,
+        text: `В этом браузере есть позиции (${local.items.length}). Перенести их в общую кладовую?`,
         ok: 'Перенести',
       });
       if (move) {
@@ -961,16 +1074,16 @@ function viewSettings() {
         LocalStore.clear();
       }
     }
-    toast('GitHub подключён');
-    go('/');
+    toast(gh ? 'Сохранено' : 'Общая кладовая создана');
+    await render(); // на экране появится ссылка-приглашение
+    if (fresh) app.querySelector('.invite')?.scrollIntoView({ behavior: 'smooth', block: 'center' });
   });
 
   formHandler('password', async (data, form) => {
     if (data.password !== data.repeat) throw new Error('Новые пароли не совпадают');
-    session = await auth.changeCredentials(session, store, data.current, data.login.trim(), data.password);
+    await auth.changePassword(cfg, session, store, data.current, data.password);
     form.reset();
-    form.elements.namedItem('login').value = session.login;
-    toast('Логин и пароль обновлены');
+    toast('Пароль обновлён');
   });
 }
 

@@ -27,9 +27,9 @@ function requireSubtle() {
   }
 }
 
-async function deriveKey(login, password, salt, iterations) {
+async function deriveKey(secret, password, salt, iterations) {
   const material = await crypto.subtle.importKey(
-    'raw', encoder.encode(`${login}\n${password}`), 'PBKDF2', false, ['deriveKey'],
+    'raw', encoder.encode(`${secret}\n${password}`), 'PBKDF2', false, ['deriveKey'],
   );
   return crypto.subtle.deriveKey(
     { name: 'PBKDF2', hash: 'SHA-256', salt, iterations },
@@ -40,13 +40,13 @@ async function deriveKey(login, password, salt, iterations) {
   );
 }
 
-// Шифрует payload ключом, полученным из логина и пароля. Сам пароль нигде
+// Шифрует payload ключом, полученным из секрета и пароля. Сам пароль нигде
 // не хранится: вход успешен, только если ящик удаётся расшифровать.
-export async function seal(login, password, payload) {
+export async function seal(secret, password, payload) {
   requireSubtle();
   const salt = crypto.getRandomValues(new Uint8Array(16));
   const iv = crypto.getRandomValues(new Uint8Array(12));
-  const key = await deriveKey(login, password, salt, ITERATIONS);
+  const key = await deriveKey(secret, password, salt, ITERATIONS);
   const ct = await crypto.subtle.encrypt({ name: 'AES-GCM', iv }, key, encoder.encode(JSON.stringify(payload)));
   return {
     v: 1,
@@ -58,14 +58,25 @@ export async function seal(login, password, payload) {
   };
 }
 
-// Возвращает расшифрованный payload или null, если логин/пароль не подходят.
-export async function unseal(login, password, box) {
+// Возвращает расшифрованный payload или null, если секрет или пароль не подходят.
+export async function unseal(secret, password, box) {
   requireSubtle();
-  const key = await deriveKey(login, password, b64ToBytes(box.salt), box.iter || ITERATIONS);
+  const key = await deriveKey(secret, password, b64ToBytes(box.salt), box.iter || ITERATIONS);
   try {
     const pt = await crypto.subtle.decrypt({ name: 'AES-GCM', iv: b64ToBytes(box.iv) }, key, b64ToBytes(box.ct));
     return JSON.parse(decoder.decode(pt));
   } catch {
     return null;
   }
+}
+
+const toB64Url = (bytes) => bytesToB64(bytes).replace(/\+/g, '-').replace(/\//g, '_').replace(/=+$/, '');
+
+// Случайный ключ кладовой (256 бит). Он передаётся в ссылке-приглашении и в репозиторий не попадает.
+export const randomKey = () => toB64Url(crypto.getRandomValues(new Uint8Array(32)));
+
+// Короткий отпечаток ключа: по нему видно, подходит ли ключ к ящику, а сам ключ из него не восстановить.
+export async function keyId(key) {
+  requireSubtle();
+  return toB64Url(new Uint8Array(await crypto.subtle.digest('SHA-256', encoder.encode(key)))).slice(0, 12);
 }
