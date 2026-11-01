@@ -1,0 +1,11 @@
+{
+  "name": "Кладовая",
+  "short_name": "Кладовая",
+  "description": "Учёт продуктов дома",
+  "start_url": "./",
+  "scope": "./",
+  "display": "standalone",
+  "background_color": "#f4f3ee",
+  "theme_color": "#2d7a4c",
+  "icons": [{ "src": "icon.svg", "sizes": "any", "type": "image/svg+xml", "purpose": "any" }]
+}
